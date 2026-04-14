@@ -11,35 +11,37 @@ defmodule ClaudeCode.Adapter.CodexTest do
   alias ClaudeCode.Message.ResultMessage
   alias ClaudeCode.Message.UserMessage
 
-  describe "adapter behaviour" do
-    test "implements all required ClaudeCode.Adapter callbacks" do
-      Code.ensure_loaded!(Codex)
-      all_callbacks = ClaudeCode.Adapter.behaviour_info(:callbacks)
-      optional_callbacks = ClaudeCode.Adapter.behaviour_info(:optional_callbacks)
-      required_callbacks = all_callbacks -- optional_callbacks
+  setup do
+    request_id = make_ref()
 
-      Enum.each(required_callbacks, fn {fun, arity} ->
-        assert function_exported?(Codex, fun, arity),
-               "Missing callback: #{fun}/#{arity}"
-      end)
+    state =
+      Codex.__new_state__(self(),
+        thread_id: "thread-xyz",
+        current_request: request_id,
+        model: "gpt-5-codex"
+      )
+
+    {:ok, state: state, request_id: request_id}
+  end
+
+  test "implements all required Adapter callbacks" do
+    Code.ensure_loaded!(Codex)
+
+    required =
+      ClaudeCode.Adapter.behaviour_info(:callbacks) --
+        ClaudeCode.Adapter.behaviour_info(:optional_callbacks)
+
+    for {fun, arity} <- required do
+      assert function_exported?(Codex, fun, arity), "Missing callback: #{fun}/#{arity}"
     end
   end
 
-  describe "agentMessageDelta → PartialAssistantMessage text_delta" do
-    setup :ready_state
+  describe "streaming deltas" do
+    test "agentMessageDelta emits text_delta stream event",
+         %{state: state, request_id: rid} do
+      dispatch(state, "agentMessageDelta", %{"itemId" => "msg_1", "delta" => "Hel"})
 
-    test "emits content_block_delta with text_delta on first delta", %{
-      state: state,
-      request_id: request_id
-    } do
-      notification = %{
-        "method" => "agentMessageDelta",
-        "params" => %{"itemId" => "msg_1", "delta" => "Hel"}
-      }
-
-      _state = Codex.__dispatch__(notification, state)
-
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %PartialAssistantMessage{
                         event: %{
                           type: :content_block_delta,
@@ -49,60 +51,29 @@ defmodule ClaudeCode.Adapter.CodexTest do
                       }}
     end
 
-    test "reuses the same index across deltas for the same item", %{
-      state: state,
-      request_id: request_id
-    } do
-      state =
-        Codex.__dispatch__(
-          %{"method" => "agentMessageDelta", "params" => %{"itemId" => "m", "delta" => "a"}},
-          state
-        )
+    test "successive deltas for the same item reuse the same index",
+         %{state: state, request_id: rid} do
+      state
+      |> dispatch("agentMessageDelta", %{"itemId" => "m", "delta" => "a"})
+      |> dispatch("agentMessageDelta", %{"itemId" => "m", "delta" => "b"})
 
-      _state =
-        Codex.__dispatch__(
-          %{"method" => "agentMessageDelta", "params" => %{"itemId" => "m", "delta" => "b"}},
-          state
-        )
+      assert_receive {:adapter_message, ^rid,
+                      %PartialAssistantMessage{event: %{index: 0, delta: %{text: "a"}}}}
 
-      assert_receive {:adapter_message, ^request_id,
-                      %PartialAssistantMessage{
-                        event: %{index: 0, delta: %{type: :text_delta, text: "a"}}
-                      }}
-
-      assert_receive {:adapter_message, ^request_id,
-                      %PartialAssistantMessage{
-                        event: %{index: 0, delta: %{type: :text_delta, text: "b"}}
-                      }}
+      assert_receive {:adapter_message, ^rid,
+                      %PartialAssistantMessage{event: %{index: 0, delta: %{text: "b"}}}}
     end
-  end
 
-  describe "reasoningTextDelta → thinking_delta" do
-    setup :ready_state
+    test "reasoningTextDelta gets a distinct index from text and emits thinking_delta",
+         %{state: state, request_id: rid} do
+      state
+      |> dispatch("agentMessageDelta", %{"itemId" => "m1", "delta" => "hi"})
+      |> dispatch("reasoningTextDelta", %{"itemId" => "r1", "delta" => "because"})
 
-    test "emits thinking_delta with a distinct index from text", %{
-      state: state,
-      request_id: request_id
-    } do
-      state =
-        Codex.__dispatch__(
-          %{"method" => "agentMessageDelta", "params" => %{"itemId" => "m1", "delta" => "hi"}},
-          state
-        )
-
-      _state =
-        Codex.__dispatch__(
-          %{
-            "method" => "reasoningTextDelta",
-            "params" => %{"itemId" => "r1", "delta" => "because"}
-          },
-          state
-        )
-
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %PartialAssistantMessage{event: %{index: 0, delta: %{type: :text_delta}}}}
 
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %PartialAssistantMessage{
                         event: %{
                           index: 1,
@@ -112,88 +83,42 @@ defmodule ClaudeCode.Adapter.CodexTest do
     end
   end
 
-  describe "itemCompleted{agent_message} → AssistantMessage with TextBlock" do
-    setup :ready_state
+  describe "item completion" do
+    test "agent_message item becomes AssistantMessage with TextBlock",
+         %{state: state, request_id: rid} do
+      dispatch_item(state, "agent_message", %{"id" => "msg_1", "text" => "Hello world"})
 
-    test "emits a finalized AssistantMessage", %{state: state, request_id: request_id} do
-      _state =
-        Codex.__dispatch__(
-          %{
-            "method" => "itemCompleted",
-            "params" => %{
-              "item" => %{"type" => "agent_message", "id" => "msg_1", "text" => "Hello world"}
-            }
-          },
-          state
-        )
-
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %AssistantMessage{
                         session_id: "thread-xyz",
-                        message: %{content: [%TextBlock{type: :text, text: "Hello world"}]}
+                        message: %{content: [%TextBlock{text: "Hello world"}]}
                       }}
     end
-  end
 
-  describe "itemCompleted{reasoning} → AssistantMessage with ThinkingBlock" do
-    setup :ready_state
+    test "reasoning item becomes AssistantMessage with ThinkingBlock (empty signature)",
+         %{state: state, request_id: rid} do
+      dispatch_item(state, "reasoning", %{"id" => "r1", "text" => "let me think"})
 
-    test "emits ThinkingBlock with empty signature (codex has no signature)", %{
-      state: state,
-      request_id: request_id
-    } do
-      _state =
-        Codex.__dispatch__(
-          %{
-            "method" => "itemCompleted",
-            "params" => %{
-              "item" => %{"type" => "reasoning", "id" => "r1", "text" => "let me think"}
-            }
-          },
-          state
-        )
-
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %AssistantMessage{
                         message: %{
                           content: [
-                            %ThinkingBlock{
-                              type: :thinking,
-                              thinking: "let me think",
-                              signature: ""
-                            }
+                            %ThinkingBlock{thinking: "let me think", signature: ""}
                           ]
                         }
                       }}
     end
-  end
 
-  describe "itemCompleted{command_execution} → synthetic tool_use + tool_result pair" do
-    setup :ready_state
+    test "command_execution emits a paired ToolUseBlock + ToolResultBlock",
+         %{state: state, request_id: rid} do
+      dispatch_item(state, "command_execution", %{
+        "id" => "cmd_42",
+        "command" => "ls -la",
+        "aggregated_output" => "total 0\n",
+        "exit_code" => 0
+      })
 
-    test "emits paired AssistantMessage (ToolUseBlock) and UserMessage (ToolResultBlock)", %{
-      state: state,
-      request_id: request_id
-    } do
-      _state =
-        Codex.__dispatch__(
-          %{
-            "method" => "itemCompleted",
-            "params" => %{
-              "item" => %{
-                "type" => "command_execution",
-                "id" => "cmd_42",
-                "command" => "ls -la",
-                "aggregated_output" => "total 0\n",
-                "exit_code" => 0,
-                "status" => "completed"
-              }
-            }
-          },
-          state
-        )
-
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %AssistantMessage{
                         message: %{
                           content: [
@@ -206,7 +131,7 @@ defmodule ClaudeCode.Adapter.CodexTest do
                         }
                       }}
 
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %UserMessage{
                         message: %{
                           content: [
@@ -220,123 +145,63 @@ defmodule ClaudeCode.Adapter.CodexTest do
                       }}
     end
 
-    test "marks the tool_result as error when exit_code is non-zero", %{
-      state: state,
-      request_id: request_id
-    } do
-      _state =
-        Codex.__dispatch__(
-          %{
-            "method" => "itemCompleted",
-            "params" => %{
-              "item" => %{
-                "type" => "command_execution",
-                "id" => "cmd_boom",
-                "command" => "false",
-                "aggregated_output" => "",
-                "exit_code" => 1,
-                "status" => "failed"
-              }
-            }
-          },
-          state
-        )
+    test "non-zero exit_code marks the tool_result as error",
+         %{state: state, request_id: rid} do
+      dispatch_item(state, "command_execution", %{
+        "id" => "boom",
+        "command" => "false",
+        "exit_code" => 1
+      })
 
-      assert_receive {:adapter_message, ^request_id, %AssistantMessage{}}
+      assert_receive {:adapter_message, ^rid, %AssistantMessage{}}
 
-      assert_receive {:adapter_message, ^request_id,
-                      %UserMessage{
-                        message: %{content: [%ToolResultBlock{is_error: true}]}
-                      }}
+      assert_receive {:adapter_message, ^rid,
+                      %UserMessage{message: %{content: [%ToolResultBlock{is_error: true}]}}}
     end
   end
 
-  describe "turnCompleted → ResultMessage" do
-    setup :ready_state
-
-    test "translates codex Usage into Claude Usage shape and nullifies current_request", %{
-      state: state,
-      request_id: request_id
-    } do
+  describe "turn boundaries" do
+    test "turnCompleted (snake_case) translates to success ResultMessage and clears request",
+         %{state: state, request_id: rid} do
       new_state =
-        Codex.__dispatch__(
-          %{
-            "method" => "turnCompleted",
-            "params" => %{
-              "usage" => %{
-                "input_tokens" => 10,
-                "cached_input_tokens" => 3,
-                "output_tokens" => 7
-              }
-            }
-          },
-          state
-        )
+        dispatch(state, "turnCompleted", %{
+          "usage" => %{
+            "input_tokens" => 10,
+            "cached_input_tokens" => 3,
+            "output_tokens" => 7
+          }
+        })
 
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %ResultMessage{
                         subtype: :success,
                         is_error: false,
                         session_id: "thread-xyz",
                         num_turns: 1,
                         total_cost_usd: 0.0,
-                        usage: %{
-                          input_tokens: 10,
-                          cache_read_input_tokens: 3,
-                          output_tokens: 7
-                        }
+                        usage: %{input_tokens: 10, cache_read_input_tokens: 3, output_tokens: 7}
                       }}
 
       assert new_state.current_request == nil
     end
 
-    test "accepts camelCase usage keys (app-server v2)", %{
-      state: state,
-      request_id: request_id
-    } do
-      _state =
-        Codex.__dispatch__(
-          %{
-            "method" => "turnCompleted",
-            "params" => %{
-              "usage" => %{
-                "inputTokens" => 5,
-                "cachedInputTokens" => 1,
-                "outputTokens" => 4
-              }
-            }
-          },
-          state
-        )
+    test "turnCompleted (camelCase) is also accepted",
+         %{state: state, request_id: rid} do
+      dispatch(state, "turnCompleted", %{
+        "usage" => %{"inputTokens" => 5, "cachedInputTokens" => 1, "outputTokens" => 4}
+      })
 
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %ResultMessage{
-                        usage: %{
-                          input_tokens: 5,
-                          cache_read_input_tokens: 1,
-                          output_tokens: 4
-                        }
+                        usage: %{input_tokens: 5, cache_read_input_tokens: 1, output_tokens: 4}
                       }}
     end
-  end
 
-  describe "turnFailed → error ResultMessage" do
-    setup :ready_state
+    test "turnFailed emits an error ResultMessage with the message",
+         %{state: state, request_id: rid} do
+      dispatch(state, "turnFailed", %{"error" => %{"message" => "upstream 500"}})
 
-    test "emits an error ResultMessage with the error message", %{
-      state: state,
-      request_id: request_id
-    } do
-      _state =
-        Codex.__dispatch__(
-          %{
-            "method" => "turnFailed",
-            "params" => %{"error" => %{"message" => "upstream 500"}}
-          },
-          state
-        )
-
-      assert_receive {:adapter_message, ^request_id,
+      assert_receive {:adapter_message, ^rid,
                       %ResultMessage{
                         is_error: true,
                         subtype: :error_during_execution,
@@ -347,48 +212,24 @@ defmodule ClaudeCode.Adapter.CodexTest do
   end
 
   describe "unknown methods" do
-    setup :ready_state
-
-    test "silently ignore unknown JSON-RPC methods", %{state: state} do
-      state =
-        Codex.__dispatch__(
-          %{"method" => "someFutureNotification", "params" => %{"x" => 1}},
-          state
-        )
-
+    test "unknown JSON-RPC method is silently ignored", %{state: state} do
+      state = dispatch(state, "someFutureNotification", %{"x" => 1})
       refute_receive {:adapter_message, _, _}, 50
-      assert %ClaudeCode.Adapter.Codex{} = state
+      assert %Codex{} = state
     end
 
-    test "silently ignore unknown item types in itemCompleted", %{state: state} do
-      state =
-        Codex.__dispatch__(
-          %{
-            "method" => "itemCompleted",
-            "params" => %{"item" => %{"type" => "web_search", "id" => "w1"}}
-          },
-          state
-        )
-
+    test "unknown itemCompleted item type is silently ignored", %{state: state} do
+      state = dispatch_item(state, "web_search", %{"id" => "w1"})
       refute_receive {:adapter_message, _, _}, 50
-      assert %ClaudeCode.Adapter.Codex{} = state
+      assert %Codex{} = state
     end
   end
 
-  # ==========================================================================
-  # Setup
-  # ==========================================================================
+  # --- Helpers ---
 
-  defp ready_state(_) do
-    request_id = make_ref()
+  defp dispatch(state, method, params),
+    do: Codex.__dispatch__(%{"method" => method, "params" => params}, state)
 
-    state =
-      Codex.__new_state__(self(),
-        thread_id: "thread-xyz",
-        current_request: request_id,
-        model: "gpt-5-codex"
-      )
-
-    {:ok, state: state, request_id: request_id}
-  end
+  defp dispatch_item(state, type, fields),
+    do: dispatch(state, "itemCompleted", %{"item" => Map.merge(%{"type" => type}, fields)})
 end

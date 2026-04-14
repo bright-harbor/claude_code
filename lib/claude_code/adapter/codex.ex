@@ -3,34 +3,14 @@ defmodule ClaudeCode.Adapter.Codex do
   Experimental adapter that drives OpenAI's `codex` CLI as a backend for the
   ClaudeCode SDK.
 
-  Instead of spawning `claude` and speaking Anthropic's stream-json protocol,
-  this adapter spawns `codex app-server --transport stdio` and speaks codex's
-  JSON-RPC 2.0 protocol. Incoming codex notifications are translated on the
-  fly into `ClaudeCode.Message.*` and `ClaudeCode.Content.*` structs and
-  delivered to `Session` via `Adapter.notify_message/3` — the same path
-  `Adapter.Test` uses — so the rest of the SDK (streams, typed messages,
-  `ResultMessage` auto-completion) is unchanged.
+  Spawns `codex app-server --transport stdio` and translates its JSON-RPC
+  notifications into `ClaudeCode.Message.*` structs in-process — the same
+  delivery path `Adapter.Test` uses — so streams, typed messages, and
+  `ResultMessage` auto-completion keep working unchanged.
 
-  This is a minimum-viable implementation covering the happy path:
-
-  - Session start (`thread/start`) → synthesized `SystemMessage` with
-    `subtype: :init`
-  - User turns (`turn/start`) with optional `system_prompt` prepended
-  - Streaming text via `PartialAssistantMessage` (`text_delta`)
-  - Streaming reasoning via `PartialAssistantMessage` (`thinking_delta`)
-  - Completed agent messages as `AssistantMessage` with a `TextBlock`
-  - Command execution / MCP tool calls as synthetic
-    `ToolUseBlock`+`ToolResultBlock` pairs
-  - Turn completion → `ResultMessage`, failure → error `ResultMessage`
-  - `interrupt/1` via `turn/interrupt`
-
-  Not implemented yet:
-
-  - `can_use_tool` / approval round-tripping (codex handles tools itself in
-    `--full-auto`; add a `ServerRequest` bridge to change this)
-  - Hook invocation
-  - MCP config translation from `--mcp-config`
-  - Cost estimation (`total_cost_usd` is stubbed to `0.0`)
+  Covers streaming text + reasoning, command / MCP tool visibility, turn
+  boundaries, and `interrupt/1`. `can_use_tool`, hooks, MCP config
+  translation, and cost estimation are intentionally out of scope.
 
   ## Usage
 
@@ -38,26 +18,14 @@ defmodule ClaudeCode.Adapter.Codex do
         ClaudeCode.start_link(
           adapter:
             {ClaudeCode.Adapter.Codex,
-             codex_path: "codex",
-             model: "gpt-5-codex",
-             cwd: File.cwd!()}
+             codex_path: "codex", model: "gpt-5-codex", cwd: File.cwd!()}
         )
 
-      ClaudeCode.query(session, "summarize this repo")
-
-  ## Config keys
-
-  - `:codex_path` — path to the `codex` binary (default: `"codex"`, resolved
-    from `$PATH`)
-  - `:model` — passed to `thread/start` params
-  - `:cwd` — working directory for the codex subprocess
-  - `:system_prompt` / `:append_system_prompt` — prepended to the first turn
-    as a `<system>` block
-  - `:codex_env` — additional environment variables (map) for codex
+  Config keys (inside the adapter tuple): `:codex_path`, `:model`, `:cwd`,
+  `:system_prompt`, `:append_system_prompt`.
   """
 
   @behaviour ClaudeCode.Adapter
-
   use GenServer
 
   alias ClaudeCode.Adapter
@@ -91,19 +59,14 @@ defmodule ClaudeCode.Adapter.Codex do
     num_turns: 0
   ]
 
-  # ============================================================================
-  # Client API (Adapter Behaviour)
-  # ============================================================================
+  # --- Adapter behaviour ---
 
   @impl ClaudeCode.Adapter
-  def start_link(session, opts) do
-    GenServer.start_link(__MODULE__, {session, opts})
-  end
+  def start_link(session, opts), do: GenServer.start_link(__MODULE__, {session, opts})
 
   @impl ClaudeCode.Adapter
-  def send_query(adapter, request_id, prompt, opts) do
-    GenServer.call(adapter, {:query, request_id, prompt, opts}, :infinity)
-  end
+  def send_query(adapter, request_id, prompt, opts),
+    do: GenServer.call(adapter, {:query, request_id, prompt, opts}, :infinity)
 
   @impl ClaudeCode.Adapter
   def health(adapter), do: GenServer.call(adapter, :health)
@@ -114,22 +77,19 @@ defmodule ClaudeCode.Adapter.Codex do
   @impl ClaudeCode.Adapter
   def interrupt(adapter), do: GenServer.call(adapter, :interrupt)
 
-  # ============================================================================
-  # Server Callbacks
-  # ============================================================================
+  # --- GenServer callbacks ---
 
   @impl GenServer
   def init({session, opts}) do
-    state = %__MODULE__{
-      session: session,
-      session_options: opts,
-      pending_system_prompt: build_system_prompt(opts)
-    }
-
     Process.link(session)
     Adapter.notify_status(session, :provisioning)
 
-    {:ok, state, {:continue, :connect}}
+    {:ok,
+     %__MODULE__{
+       session: session,
+       session_options: opts,
+       pending_system_prompt: build_system_prompt(opts)
+     }, {:continue, :connect}}
   end
 
   @impl GenServer
@@ -137,11 +97,7 @@ defmodule ClaudeCode.Adapter.Codex do
     case open_codex_port(state) do
       {:ok, port} ->
         state = %{state | port: port}
-        # Kick off thread/start immediately so Session transitions to :ready
-        # once we receive the response and synthesize the init message.
-        {_id, state} =
-          send_rpc(state, "thread/start", thread_start_params(state), :thread_start)
-
+        {_id, state} = send_rpc(state, "thread/start", thread_start_params(state), :thread_start)
         {:noreply, state}
 
       {:error, reason} ->
@@ -153,23 +109,19 @@ defmodule ClaudeCode.Adapter.Codex do
   @impl GenServer
   def handle_call({:query, request_id, prompt, opts}, _from, state) do
     session_id = state.thread_id || Keyword.get(opts, :session_id, "codex")
-
     full_prompt = prepend_system_prompt(prompt, state.pending_system_prompt)
 
-    state = %{
-      state
-      | current_request: request_id,
-        turn_started_at: System.monotonic_time(:millisecond),
-        num_turns: state.num_turns + 1,
-        block_indexes: %{},
-        next_index: 0,
-        pending_system_prompt: nil
-    }
-
-    # Claude emits the system/init message at the start of the first turn's
-    # stream, not at handshake time. We cached it on thread/start; flush it
-    # now so consumers see it on the same request stream.
-    state = flush_pending_init(state)
+    state =
+      %{
+        state
+        | current_request: request_id,
+          turn_started_at: System.monotonic_time(:millisecond),
+          num_turns: state.num_turns + 1,
+          block_indexes: %{},
+          next_index: 0,
+          pending_system_prompt: nil
+      }
+      |> flush_pending_init()
 
     params = %{
       "threadId" => session_id,
@@ -180,34 +132,22 @@ defmodule ClaudeCode.Adapter.Codex do
     {:reply, :ok, state}
   end
 
-  def handle_call(:health, _from, state) do
-    health =
-      case state.status do
-        :ready -> :healthy
-        :provisioning -> {:unhealthy, :provisioning}
-        other -> {:unhealthy, other}
-      end
+  def handle_call(:health, _from, %{status: :ready} = state), do: {:reply, :healthy, state}
 
-    {:reply, health, state}
-  end
+  def handle_call(:health, _from, %{status: status} = state),
+    do: {:reply, {:unhealthy, status}, state}
 
-  def handle_call(:interrupt, _from, state) do
-    case state.thread_id do
-      nil ->
-        {:reply, :ok, state}
+  def handle_call(:interrupt, _from, %{thread_id: nil} = state), do: {:reply, :ok, state}
 
-      tid ->
-        {_, state} = send_rpc(state, "turn/interrupt", %{"threadId" => tid}, :interrupt)
-        {:reply, :ok, state}
-    end
+  def handle_call(:interrupt, _from, %{thread_id: tid} = state) do
+    {_, state} = send_rpc(state, "turn/interrupt", %{"threadId" => tid}, :interrupt)
+    {:reply, :ok, state}
   end
 
   @impl GenServer
   def handle_info({port, {:data, chunk}}, %{port: port} = state) do
     {lines, rest} = extract_lines(state.buffer <> chunk)
-    state = %{state | buffer: rest}
-    state = Enum.reduce(lines, state, &process_line/2)
-    {:noreply, state}
+    {:noreply, Enum.reduce(lines, %{state | buffer: rest}, &process_line/2)}
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
@@ -219,24 +159,17 @@ defmodule ClaudeCode.Adapter.Codex do
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl GenServer
-  def terminate(_reason, %{port: port} = state) when is_port(port) do
-    if state.thread_id do
-      # Best-effort interrupt; ignore failures on shutdown.
-      line = encode_rpc(0, "turn/interrupt", %{"threadId" => state.thread_id})
-      send_port(port, line)
-    end
-
+  def terminate(_reason, %{port: port, thread_id: tid} = _state) when is_port(port) do
+    if tid, do: Port.command(port, encode_rpc(0, "turn/interrupt", %{"threadId" => tid}))
     Port.close(port)
     :ok
   rescue
     _ -> :ok
   end
 
-  def terminate(_reason, _state), do: :ok
+  def terminate(_, _), do: :ok
 
-  # ============================================================================
-  # Line processing
-  # ============================================================================
+  # --- Line processing ---
 
   @doc false
   def extract_lines(buffer) do
@@ -255,17 +188,11 @@ defmodule ClaudeCode.Adapter.Codex do
     end
   end
 
-  # JSON-RPC response: either a thread/start ack or another call ack.
+  # Response to one of our own JSON-RPC requests.
   defp dispatch(%{"id" => id, "result" => result}, state) do
     case Map.pop(state.pending_rpc, id) do
       {:thread_start, rest} ->
         thread_id = get_in(result, ["thread", "id"]) || result["threadId"] || "codex-thread"
-
-        # Cache the init message until the first user turn begins, because
-        # Session drops adapter_message for a request_id it doesn't know
-        # about. Matches the Claude CLI, which emits system/init inside
-        # the first turn's stream, not at handshake time.
-        init_msg = build_init_message(thread_id, state)
         Adapter.notify_status(state.session, :ready)
 
         %{
@@ -273,12 +200,10 @@ defmodule ClaudeCode.Adapter.Codex do
           | thread_id: thread_id,
             pending_rpc: rest,
             status: :ready,
-            pending_init_message: init_msg
+            pending_init_message: build_init_message(thread_id, state)
         }
 
       {_tag_or_nil, rest} ->
-        # Ack for turn/start, turn/interrupt, or unknown id — nothing to do
-        # beyond clearing the pending entry.
         %{state | pending_rpc: rest}
     end
   end
@@ -288,34 +213,24 @@ defmodule ClaudeCode.Adapter.Codex do
     %{state | pending_rpc: Map.delete(state.pending_rpc, id)}
   end
 
-  # JSON-RPC notification: the interesting stream.
   defp dispatch(%{"method" => method, "params" => params}, state),
     do: translate(method, params, state)
 
   defp dispatch(_, state), do: state
 
-  # ============================================================================
-  # Notification → Claude message translation
-  # ============================================================================
+  # --- Codex notification -> Claude message translation ---
 
-  # Agent text deltas — character-level streaming.
-  defp translate("agentMessageDelta", %{"itemId" => item_id, "delta" => delta}, state) do
-    {idx, state} = index_for(state, item_id)
-    emit_stream_event(state, content_block_delta(idx, %{type: :text_delta, text: delta}))
+  defp translate("agentMessageDelta", %{"itemId" => id, "delta" => d}, state) do
+    {idx, state} = index_for(state, id)
+    emit_stream_event(state, content_block_delta(idx, %{type: :text_delta, text: d}))
   end
 
-  defp translate("reasoningTextDelta", %{"itemId" => item_id, "delta" => delta}, state) do
-    {idx, state} = index_for(state, {:thinking, item_id})
-    emit_stream_event(state, content_block_delta(idx, %{type: :thinking_delta, thinking: delta}))
+  defp translate(method, %{"itemId" => id, "delta" => d}, state)
+       when method in ~w(reasoningTextDelta reasoningSummaryTextDelta) do
+    {idx, state} = index_for(state, {:thinking, id})
+    emit_stream_event(state, content_block_delta(idx, %{type: :thinking_delta, thinking: d}))
   end
 
-  defp translate("reasoningSummaryTextDelta", %{"itemId" => item_id, "delta" => delta}, state) do
-    {idx, state} = index_for(state, {:thinking, item_id})
-    emit_stream_event(state, content_block_delta(idx, %{type: :thinking_delta, thinking: delta}))
-  end
-
-  # Item lifecycle — agent_message: announce a text block up front, then on
-  # completion emit a finalized AssistantMessage with the full TextBlock.
   defp translate("itemStarted", %{"item" => %{"type" => "agent_message", "id" => id}}, state) do
     {idx, state} = index_for(state, id)
     emit_stream_event(state, content_block_start(idx, %{type: :text, text: ""}))
@@ -328,13 +243,9 @@ defmodule ClaudeCode.Adapter.Codex do
        ) do
     {idx, state} = index_for(state, id)
     msg = assistant_message(state, id, [text_block(text)], :end_turn)
-
-    state
-    |> emit_stream_event(content_block_stop(idx))
-    |> notify(msg)
+    state |> emit_stream_event(content_block_stop(idx)) |> notify(msg)
   end
 
-  # Reasoning items — final ThinkingBlock on completion.
   defp translate(
          "itemCompleted",
          %{"item" => %{"type" => "reasoning", "id" => id, "text" => text}},
@@ -342,14 +253,9 @@ defmodule ClaudeCode.Adapter.Codex do
        ) do
     {idx, state} = index_for(state, {:thinking, id})
     msg = assistant_message(state, id, [thinking_block(text)], nil)
-
-    state
-    |> emit_stream_event(content_block_stop(idx))
-    |> notify(msg)
+    state |> emit_stream_event(content_block_stop(idx)) |> notify(msg)
   end
 
-  # Command execution — fabricate a tool_use/tool_result pair so
-  # `ClaudeCode.Stream.tool_uses/1` still surfaces everything codex ran.
   defp translate(
          "itemCompleted",
          %{"item" => %{"type" => "command_execution", "id" => id, "command" => command} = item},
@@ -380,14 +286,6 @@ defmodule ClaudeCode.Adapter.Codex do
     })
   end
 
-  # Unhandled item types: silently ignore (file_change, web_search, todo_list
-  # etc. would land here). The stream still works, we just don't surface them.
-  defp translate("itemStarted", _params, state), do: state
-  defp translate("itemUpdated", _params, state), do: state
-  defp translate("itemCompleted", _params, state), do: state
-
-  defp translate("turnStarted", _params, state), do: state
-
   defp translate("turnCompleted", %{"usage" => usage}, state) do
     state
     |> notify(
@@ -404,14 +302,13 @@ defmodule ClaudeCode.Adapter.Codex do
   defp translate("turnFailed", %{"error" => %{"message" => message}}, state),
     do: fail_turn(state, message)
 
-  defp translate("turnFailed", _params, state),
-    do: fail_turn(state, "codex turn failed")
+  defp translate("turnFailed", _params, state), do: fail_turn(state, "codex turn failed")
 
+  # Everything else (itemStarted/itemUpdated for other item types, turnStarted,
+  # unknown future methods) is silently ignored.
   defp translate(_method, _params, state), do: state
 
-  # ============================================================================
-  # Message builders
-  # ============================================================================
+  # --- Message builders ---
 
   defp assistant_message(state, id, content, stop_reason) do
     %AssistantMessage{
@@ -425,7 +322,7 @@ defmodule ClaudeCode.Adapter.Codex do
         model: nil,
         stop_reason: stop_reason,
         stop_sequence: nil,
-        usage: empty_usage(),
+        usage: base_usage(),
         context_management: nil
       }
     }
@@ -449,7 +346,7 @@ defmodule ClaudeCode.Adapter.Codex do
       num_turns: state.num_turns,
       session_id: state.thread_id,
       total_cost_usd: 0.0,
-      usage: empty_result_usage(),
+      usage: base_usage(),
       result: nil,
       stop_reason: nil,
       model_usage: %{},
@@ -468,14 +365,13 @@ defmodule ClaudeCode.Adapter.Codex do
   defp tool_use_block(id, name, input),
     do: %ToolUseBlock{type: :tool_use, id: id, name: name, input: input}
 
-  defp tool_result_block(tool_use_id, content, is_error) do
-    %ToolResultBlock{
+  defp tool_result_block(tool_use_id, content, is_error),
+    do: %ToolResultBlock{
       type: :tool_result,
       tool_use_id: tool_use_id,
       content: content,
       is_error: is_error
     }
-  end
 
   defp fail_turn(state, message) do
     state
@@ -498,19 +394,16 @@ defmodule ClaudeCode.Adapter.Codex do
          content: content,
          is_error: is_error
        }) do
-    use_block = tool_use_block(tool_use_id, name, input)
-    result_block = tool_result_block(tool_use_id, content, is_error)
-
     state
-    |> notify(assistant_message(state, item_id, [use_block], :tool_use))
-    |> notify(user_message(state, [result_block]))
+    |> notify(
+      assistant_message(state, item_id, [tool_use_block(tool_use_id, name, input)], :tool_use)
+    )
+    |> notify(user_message(state, [tool_result_block(tool_use_id, content, is_error)]))
   end
 
   defp clear_request(state), do: %{state | current_request: nil}
 
-  # ============================================================================
-  # Small helpers
-  # ============================================================================
+  # --- Small helpers ---
 
   defp notify(%{current_request: nil} = state, _msg), do: state
 
@@ -522,21 +415,15 @@ defmodule ClaudeCode.Adapter.Codex do
   defp flush_pending_init(%{pending_init_message: nil} = state), do: state
 
   defp flush_pending_init(%{pending_init_message: init} = state) do
-    Adapter.notify_message(state.session, state.current_request, init)
-    %{state | pending_init_message: nil}
+    state |> notify(init) |> Map.put(:pending_init_message, nil)
   end
 
-  defp emit_stream_event(%{current_request: nil} = state, _event), do: state
-
   defp emit_stream_event(state, event) do
-    partial = %PartialAssistantMessage{
+    notify(state, %PartialAssistantMessage{
       type: :stream_event,
       event: event,
       session_id: state.thread_id
-    }
-
-    Adapter.notify_message(state.session, state.current_request, partial)
-    state
+    })
   end
 
   defp content_block_start(index, block),
@@ -545,37 +432,28 @@ defmodule ClaudeCode.Adapter.Codex do
   defp content_block_delta(index, delta),
     do: %{type: :content_block_delta, index: index, delta: delta}
 
-  defp content_block_stop(index),
-    do: %{type: :content_block_stop, index: index}
+  defp content_block_stop(index), do: %{type: :content_block_stop, index: index}
 
-  defp index_for(state, key) do
-    case Map.fetch(state.block_indexes, key) do
-      {:ok, idx} ->
+  defp index_for(%{block_indexes: map} = state, key) do
+    case map do
+      %{^key => idx} ->
         {idx, state}
 
-      :error ->
+      _ ->
         idx = state.next_index
-
-        {idx,
-         %{
-           state
-           | block_indexes: Map.put(state.block_indexes, key, idx),
-             next_index: idx + 1
-         }}
+        {idx, %{state | block_indexes: Map.put(map, key, idx), next_index: idx + 1}}
     end
   end
 
   defp build_init_message(thread_id, state) do
-    model = Keyword.get(state.session_options, :model) || "codex"
-
     %SystemMessage{
       type: :system,
       subtype: :init,
       session_id: thread_id,
-      cwd: Keyword.get(state.session_options, :cwd),
-      tools: ["Bash", "Read", "Write", "Edit", "WebSearch"],
+      cwd: state.session_options[:cwd],
+      tools: ~w(Bash Read Write Edit WebSearch),
       mcp_servers: [],
-      model: model,
+      model: state.session_options[:model] || "codex",
       permission_mode: :default,
       api_key_source: "codex",
       claude_code_version: nil
@@ -583,49 +461,37 @@ defmodule ClaudeCode.Adapter.Codex do
   end
 
   defp thread_start_params(state) do
-    opts = state.session_options
-
-    base = %{}
-    base = maybe_put(base, "model", Keyword.get(opts, :model))
-    base = maybe_put(base, "cwd", Keyword.get(opts, :cwd))
-    base
+    state.session_options
+    |> Keyword.take([:model, :cwd])
+    |> Enum.reject(fn {_, v} -> is_nil(v) end)
+    |> Map.new(fn {k, v} -> {to_string(k), v} end)
   end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
   defp build_system_prompt(opts) do
-    case {Keyword.get(opts, :system_prompt), Keyword.get(opts, :append_system_prompt)} do
-      {nil, nil} -> nil
-      {sp, nil} -> sp
-      {nil, ap} -> ap
-      {sp, ap} -> sp <> "\n\n" <> ap
+    case Enum.reject([opts[:system_prompt], opts[:append_system_prompt]], &is_nil/1) do
+      [] -> nil
+      parts -> Enum.join(parts, "\n\n")
     end
   end
 
   defp prepend_system_prompt(prompt, nil), do: prompt
 
   defp prepend_system_prompt(prompt, system),
-    do: "<system>\n" <> system <> "\n</system>\n\n" <> prompt
+    do: "<system>\n#{system}\n</system>\n\n#{prompt}"
 
   defp codex_usage_to_claude(%{} = usage) do
     %{
-      input_tokens: usage["input_tokens"] || usage["inputTokens"] || 0,
-      cache_creation_input_tokens: 0,
-      cache_read_input_tokens: usage["cached_input_tokens"] || usage["cachedInputTokens"] || 0,
-      output_tokens: usage["output_tokens"] || usage["outputTokens"] || 0,
-      server_tool_use: %{web_search_requests: 0, web_fetch_requests: 0},
-      service_tier: nil,
-      cache_creation: nil,
-      inference_geo: nil,
-      iterations: [],
-      speed: nil
+      base_usage()
+      | input_tokens: usage["input_tokens"] || usage["inputTokens"] || 0,
+        cache_read_input_tokens:
+          usage["cached_input_tokens"] || usage["cachedInputTokens"] || 0,
+        output_tokens: usage["output_tokens"] || usage["outputTokens"] || 0
     }
   end
 
-  defp codex_usage_to_claude(_), do: empty_result_usage()
+  defp codex_usage_to_claude(_), do: base_usage()
 
-  defp empty_result_usage do
+  defp base_usage do
     %{
       input_tokens: 0,
       cache_creation_input_tokens: 0,
@@ -640,23 +506,10 @@ defmodule ClaudeCode.Adapter.Codex do
     }
   end
 
-  defp empty_usage do
-    %{
-      input_tokens: 0,
-      output_tokens: 0,
-      cache_creation_input_tokens: nil,
-      cache_read_input_tokens: nil,
-      cache_creation: nil,
-      service_tier: nil,
-      inference_geo: nil
-    }
-  end
-
   defp format_mcp_result(%{"error" => %{"message" => msg}}) when is_binary(msg), do: msg
 
   defp format_mcp_result(%{"result" => %{"content" => content}}) when is_list(content) do
-    content
-    |> Enum.map_join("\n", fn
+    Enum.map_join(content, "\n", fn
       %{"text" => text} when is_binary(text) -> text
       other -> inspect(other)
     end)
@@ -664,22 +517,12 @@ defmodule ClaudeCode.Adapter.Codex do
 
   defp format_mcp_result(_), do: ""
 
-  # ============================================================================
-  # JSON-RPC I/O
-  # ============================================================================
+  # --- JSON-RPC I/O ---
 
   defp send_rpc(state, method, params, tag) do
     id = state.rpc_counter + 1
-    line = encode_rpc(id, method, params)
-    send_port(state.port, line)
-
-    state = %{
-      state
-      | rpc_counter: id,
-        pending_rpc: Map.put(state.pending_rpc, id, tag)
-    }
-
-    {id, state}
+    Port.command(state.port, encode_rpc(id, method, params))
+    {id, %{state | rpc_counter: id, pending_rpc: Map.put(state.pending_rpc, id, tag)}}
   end
 
   defp encode_rpc(id, method, params) do
@@ -687,41 +530,25 @@ defmodule ClaudeCode.Adapter.Codex do
       "\n"
   end
 
-  defp send_port(port, line) when is_port(port) do
-    try do
-      Port.command(port, line)
-    rescue
-      _ -> :error
-    end
-  end
-
-  # ============================================================================
-  # Port spawning
-  # ============================================================================
+  # --- Port spawning ---
 
   defp open_codex_port(state) do
-    codex_path = Keyword.get(state.session_options, :codex_path, "codex")
+    path = state.session_options[:codex_path] || "codex"
 
-    case resolve_executable(codex_path) do
+    case resolve_executable(path) do
       nil ->
-        {:error, {:codex_not_found, codex_path}}
+        {:error, {:codex_not_found, path}}
 
       exe ->
-        args = ["app-server", "--transport", "stdio"]
+        port =
+          Port.open({:spawn_executable, exe}, [
+            {:args, ["app-server", "--transport", "stdio"]},
+            :binary,
+            :exit_status,
+            :stderr_to_stdout
+          ])
 
-        try do
-          port =
-            Port.open({:spawn_executable, exe}, [
-              {:args, args},
-              :binary,
-              :exit_status,
-              :stderr_to_stdout
-            ])
-
-          {:ok, port}
-        rescue
-          e -> {:error, {:port_open_failed, Exception.message(e)}}
-        end
+        {:ok, port}
     end
   end
 
@@ -738,13 +565,9 @@ defmodule ClaudeCode.Adapter.Codex do
 
   defp resolve_executable(_), do: nil
 
-  # ============================================================================
-  # Test seams
-  # ============================================================================
+  # --- Test seams ---
 
   @doc false
-  # Public entry point used by tests to feed a decoded JSON-RPC payload
-  # through the same dispatcher the live Port path uses.
   def __dispatch__(json, state), do: dispatch(json, state)
 
   @doc false
@@ -753,10 +576,10 @@ defmodule ClaudeCode.Adapter.Codex do
       session: session,
       session_options: opts,
       pending_system_prompt: build_system_prompt(opts),
-      thread_id: Keyword.get(opts, :thread_id),
-      current_request: Keyword.get(opts, :current_request),
+      thread_id: opts[:thread_id],
+      current_request: opts[:current_request],
       turn_started_at: System.monotonic_time(:millisecond),
-      num_turns: Keyword.get(opts, :num_turns, 1),
+      num_turns: opts[:num_turns] || 1,
       status: :ready
     }
   end
