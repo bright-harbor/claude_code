@@ -314,168 +314,70 @@ defmodule ClaudeCode.Adapter.Codex do
     emit_stream_event(state, content_block_delta(idx, %{type: :thinking_delta, thinking: delta}))
   end
 
-  # Item lifecycle — agent_message: announce a text block, on completion emit
-  # a proper AssistantMessage with the finished TextBlock.
-  defp translate("itemStarted", %{"item" => %{"type" => "agent_message", "id" => item_id}}, state) do
-    {idx, state} = index_for(state, item_id)
+  # Item lifecycle — agent_message: announce a text block up front, then on
+  # completion emit a finalized AssistantMessage with the full TextBlock.
+  defp translate("itemStarted", %{"item" => %{"type" => "agent_message", "id" => id}}, state) do
+    {idx, state} = index_for(state, id)
     emit_stream_event(state, content_block_start(idx, %{type: :text, text: ""}))
   end
 
   defp translate(
          "itemCompleted",
-         %{"item" => %{"type" => "agent_message", "id" => item_id, "text" => text}},
+         %{"item" => %{"type" => "agent_message", "id" => id, "text" => text}},
          state
        ) do
-    {idx, state} = index_for(state, item_id)
-    state = emit_stream_event(state, content_block_stop(idx))
+    {idx, state} = index_for(state, id)
+    msg = assistant_message(state, id, [text_block(text)], :end_turn)
 
-    msg = %AssistantMessage{
-      type: :assistant,
-      session_id: state.thread_id,
-      message: %{
-        id: item_id,
-        type: :message,
-        role: :assistant,
-        content: [%TextBlock{type: :text, text: text}],
-        model: nil,
-        stop_reason: :end_turn,
-        stop_sequence: nil,
-        usage: empty_usage(),
-        context_management: nil
-      }
-    }
-
-    notify(state, msg)
+    state
+    |> emit_stream_event(content_block_stop(idx))
+    |> notify(msg)
   end
 
-  # Reasoning items — emit a final ThinkingBlock when complete.
+  # Reasoning items — final ThinkingBlock on completion.
   defp translate(
          "itemCompleted",
-         %{"item" => %{"type" => "reasoning", "id" => item_id, "text" => text}},
+         %{"item" => %{"type" => "reasoning", "id" => id, "text" => text}},
          state
        ) do
-    {idx, state} = index_for(state, {:thinking, item_id})
-    state = emit_stream_event(state, content_block_stop(idx))
+    {idx, state} = index_for(state, {:thinking, id})
+    msg = assistant_message(state, id, [thinking_block(text)], nil)
 
-    msg = %AssistantMessage{
-      type: :assistant,
-      session_id: state.thread_id,
-      message: %{
-        id: item_id,
-        type: :message,
-        role: :assistant,
-        content: [%ThinkingBlock{type: :thinking, thinking: text, signature: ""}],
-        model: nil,
-        stop_reason: nil,
-        stop_sequence: nil,
-        usage: empty_usage(),
-        context_management: nil
-      }
-    }
-
-    notify(state, msg)
+    state
+    |> emit_stream_event(content_block_stop(idx))
+    |> notify(msg)
   end
 
   # Command execution — fabricate a tool_use/tool_result pair so
-  # ClaudeCode.Stream.tool_uses/1 keeps working as a read-only view of what
-  # codex actually ran.
+  # `ClaudeCode.Stream.tool_uses/1` still surfaces everything codex ran.
   defp translate(
          "itemCompleted",
-         %{"item" => %{"type" => "command_execution"} = item},
+         %{"item" => %{"type" => "command_execution", "id" => id, "command" => command} = item},
          state
        ) do
-    tool_use_id = "codex_cmd_#{item["id"]}"
-
-    use_msg = %AssistantMessage{
-      type: :assistant,
-      session_id: state.thread_id,
-      message: %{
-        id: item["id"],
-        type: :message,
-        role: :assistant,
-        content: [
-          %ToolUseBlock{
-            type: :tool_use,
-            id: tool_use_id,
-            name: "Bash",
-            input: %{"command" => item["command"]}
-          }
-        ],
-        model: nil,
-        stop_reason: :tool_use,
-        stop_sequence: nil,
-        usage: empty_usage(),
-        context_management: nil
-      }
-    }
-
-    result_msg = %UserMessage{
-      type: :user,
-      session_id: state.thread_id,
-      message: %{
-        role: :user,
-        content: [
-          %ToolResultBlock{
-            type: :tool_result,
-            tool_use_id: tool_use_id,
-            content: item["aggregated_output"] || "",
-            is_error: (item["exit_code"] || 0) != 0
-          }
-        ]
-      }
-    }
-
-    state |> notify(use_msg) |> notify(result_msg)
+    emit_tool_pair(state, %{
+      item_id: id,
+      tool_use_id: "codex_cmd_#{id}",
+      name: "Bash",
+      input: %{"command" => command},
+      content: item["aggregated_output"] || "",
+      is_error: (item["exit_code"] || 0) != 0
+    })
   end
 
   defp translate(
          "itemCompleted",
-         %{"item" => %{"type" => "mcp_tool_call"} = item},
+         %{"item" => %{"type" => "mcp_tool_call", "id" => id} = item},
          state
        ) do
-    tool_use_id = "codex_mcp_#{item["id"]}"
-    tool_name = "#{item["server"] || "mcp"}__#{item["tool"] || "unknown"}"
-
-    use_msg = %AssistantMessage{
-      type: :assistant,
-      session_id: state.thread_id,
-      message: %{
-        id: item["id"],
-        type: :message,
-        role: :assistant,
-        content: [
-          %ToolUseBlock{
-            type: :tool_use,
-            id: tool_use_id,
-            name: tool_name,
-            input: item["arguments"] || %{}
-          }
-        ],
-        model: nil,
-        stop_reason: :tool_use,
-        stop_sequence: nil,
-        usage: empty_usage(),
-        context_management: nil
-      }
-    }
-
-    result_msg = %UserMessage{
-      type: :user,
-      session_id: state.thread_id,
-      message: %{
-        role: :user,
-        content: [
-          %ToolResultBlock{
-            type: :tool_result,
-            tool_use_id: tool_use_id,
-            content: format_mcp_result(item),
-            is_error: item["error"] != nil
-          }
-        ]
-      }
-    }
-
-    state |> notify(use_msg) |> notify(result_msg)
+    emit_tool_pair(state, %{
+      item_id: id,
+      tool_use_id: "codex_mcp_#{id}",
+      name: "#{item["server"] || "mcp"}__#{item["tool"] || "unknown"}",
+      input: item["arguments"] || %{},
+      content: format_mcp_result(item),
+      is_error: item["error"] != nil
+    })
   end
 
   # Unhandled item types: silently ignore (file_change, web_search, todo_list
@@ -487,54 +389,124 @@ defmodule ClaudeCode.Adapter.Codex do
   defp translate("turnStarted", _params, state), do: state
 
   defp translate("turnCompleted", %{"usage" => usage}, state) do
-    duration = System.monotonic_time(:millisecond) - (state.turn_started_at || 0)
-
-    msg = %ResultMessage{
-      type: :result,
-      subtype: :success,
-      is_error: false,
-      duration_ms: duration * 1.0,
-      duration_api_ms: duration * 1.0,
-      num_turns: state.num_turns,
-      session_id: state.thread_id,
-      total_cost_usd: 0.0,
-      usage: codex_usage_to_claude(usage),
-      result: nil,
-      stop_reason: :end_turn,
-      model_usage: %{},
-      permission_denials: [],
-      errors: nil
-    }
-
-    state = notify(state, msg)
-    %{state | current_request: nil}
+    state
+    |> notify(
+      result_message(state,
+        subtype: :success,
+        is_error: false,
+        usage: codex_usage_to_claude(usage),
+        stop_reason: :end_turn
+      )
+    )
+    |> clear_request()
   end
 
-  defp translate("turnFailed", %{"error" => error}, state) do
+  defp translate("turnFailed", %{"error" => %{"message" => message}}, state),
+    do: fail_turn(state, message)
+
+  defp translate("turnFailed", _params, state),
+    do: fail_turn(state, "codex turn failed")
+
+  defp translate(_method, _params, state), do: state
+
+  # ============================================================================
+  # Message builders
+  # ============================================================================
+
+  defp assistant_message(state, id, content, stop_reason) do
+    %AssistantMessage{
+      type: :assistant,
+      session_id: state.thread_id,
+      message: %{
+        id: id,
+        type: :message,
+        role: :assistant,
+        content: content,
+        model: nil,
+        stop_reason: stop_reason,
+        stop_sequence: nil,
+        usage: empty_usage(),
+        context_management: nil
+      }
+    }
+  end
+
+  defp user_message(state, content) do
+    %UserMessage{
+      type: :user,
+      session_id: state.thread_id,
+      message: %{role: :user, content: content}
+    }
+  end
+
+  defp result_message(state, attrs) do
     duration = System.monotonic_time(:millisecond) - (state.turn_started_at || 0)
 
-    msg = %ResultMessage{
+    base = [
       type: :result,
-      subtype: :error_during_execution,
-      is_error: true,
       duration_ms: duration * 1.0,
       duration_api_ms: duration * 1.0,
       num_turns: state.num_turns,
       session_id: state.thread_id,
       total_cost_usd: 0.0,
       usage: empty_result_usage(),
-      result: error["message"],
+      result: nil,
       stop_reason: nil,
       model_usage: %{},
       permission_denials: [],
-      errors: [error["message"] || "codex turn failed"]
-    }
+      errors: nil
+    ]
 
-    state = notify(state, msg)
-    %{state | current_request: nil}
+    struct!(ResultMessage, Keyword.merge(base, attrs))
   end
 
-  defp translate(_method, _params, state), do: state
+  defp text_block(text), do: %TextBlock{type: :text, text: text}
+
+  defp thinking_block(text),
+    do: %ThinkingBlock{type: :thinking, thinking: text, signature: ""}
+
+  defp tool_use_block(id, name, input),
+    do: %ToolUseBlock{type: :tool_use, id: id, name: name, input: input}
+
+  defp tool_result_block(tool_use_id, content, is_error) do
+    %ToolResultBlock{
+      type: :tool_result,
+      tool_use_id: tool_use_id,
+      content: content,
+      is_error: is_error
+    }
+  end
+
+  defp fail_turn(state, message) do
+    state
+    |> notify(
+      result_message(state,
+        subtype: :error_during_execution,
+        is_error: true,
+        result: message,
+        errors: [message]
+      )
+    )
+    |> clear_request()
+  end
+
+  defp emit_tool_pair(state, %{
+         item_id: item_id,
+         tool_use_id: tool_use_id,
+         name: name,
+         input: input,
+         content: content,
+         is_error: is_error
+       }) do
+    use_block = tool_use_block(tool_use_id, name, input)
+    result_block = tool_result_block(tool_use_id, content, is_error)
+
+    state
+    |> notify(assistant_message(state, item_id, [use_block], :tool_use))
+    |> notify(user_message(state, [result_block]))
+  end
+
+  defp clear_request(state), do: %{state | current_request: nil}
 
   # ============================================================================
   # Small helpers
